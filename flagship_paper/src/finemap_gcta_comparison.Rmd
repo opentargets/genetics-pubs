@@ -1,0 +1,357 @@
+---
+title: "Finemap vs GCTA comparison for OTG main paper"
+author: "Jeremy Schwartzentruber"
+date: "3/2/2021"
+output: html_document
+---
+
+We consider five well-powered GWAS from UK Biobank:
+
+- Atrial fibrillation (SAIGE_427_2)
+- Diabetes mellitus (SAIGE_250)
+- Hair colour blonde (NEALE2_1747_1)
+- College or university degree (NEALE2_6138_1)
+- Monocyte count (NEALE2_30130_raw)
+
+We applied FINEMAP to all independent signals (identified by GCTA) +/- 500 kb from the lead SNP. We compare the FINEMAP results with GCTA.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(tidyverse)
+library(jsonlite)
+library(rjson)
+finemapping_dir = "~/work/otgenetics/genetics-finemapping"
+theme_set(theme_bw())
+```
+
+## Load data
+
+We load in the GCTA and FINEMAP results and merge them into one table.
+
+For GCTA we have SNPs in the 99% credible set, and we'll consider the subset that are in the 95% credible set.
+For FINEMAP we have all SNPs at each locus. It's not straightforward to consider "credible sets" for finemap, since each locus can have multiple signals, and the true number of causal variants is unknown.
+
+GCTA number of independent signals:
+
+```{r, warning=FALSE}
+# First load GCTA credset SNPs
+gcta_credset_file = file.path(finemapping_dir, "results/credset.json.gz")
+gcta_credset = jsonlite::stream_in(file(gcta_credset_file), verbose = F)
+gcta_credset = gcta_credset %>%
+  rename(gcta_prob = postprob,
+         gcta_chr = tag_chrom,
+         gcta_pos = tag_pos,
+         variant_id = tag_variant_id)
+
+nrow(unique(gcta_credset %>% select(study_id, lead_variant_id)))
+
+# Take the max fine-mapping probability across independent signals at each study/locus.
+gcta_credset = gcta_credset %>%
+  arrange(desc(gcta_prob)) %>%
+  group_by(study_id, variant_id) %>%
+  summarise(is95_credset = any(is95_credset),
+            gcta_prob = max(gcta_prob),
+            gcta_chr = first(gcta_chr),
+            gcta_pos = first(gcta_pos),
+            lead_variant_id = first(lead_variant_id),
+            lead_chr = first(lead_chrom),
+            lead_pos = first(lead_pos),
+            tag_pval = first(tag_pval),
+            .groups = 'drop')
+```
+
+GCTA number of SNPs (in 99% credsets):
+
+```{r}
+nrow(gcta_credset)
+```
+
+GCTA number of SNPs with prob > 0.5.
+
+```{r}
+nrow(gcta_credset %>% filter(gcta_prob > 0.5))
+```
+
+FINEMAP number of SNPs (with fine-mapping probability > 0.0001):
+
+```{r}
+# Load FINEMAP SNPs
+finemap_res = read_csv(file.path(finemapping_dir, "results/finemap_snp.csv.gz"), col_types = cols())
+finemap_flt = finemap_res %>%
+#  filter(prob > 0.0001) %>%
+  rename(finemap_prob = prob,
+         finemap_chr = chromosome,
+         finemap_pos = position,
+         finemap_variant_id = rsid)
+
+# First find a way to summarise the finemap results, which have a FINEMAP run
+# for each indpeendent GCTA signal at each locus. We take the max across
+# probability values for each SNP that was in multiple runs.
+finemap_probs = finemap_flt %>%
+  group_by(study_id, finemap_variant_id) %>%
+  arrange(finemap_chr, finemap_pos, desc(finemap_prob)) %>%
+  summarise(finemap_chr = as.character(first(finemap_chr)),
+            finemap_pos = as.integer(first(finemap_pos)),
+            finemap_variant_id = first(finemap_variant_id),
+            finemap_prob = max(finemap_prob),
+            finemap_locus = first(locus_name),
+            locus_signals = paste(locus_name, collapse = " "),
+            .groups = 'drop')
+
+sum(finemap_probs$finemap_prob > 0.0001)
+#sum(duplicated(finemap_probs$finemap_variant_id))
+```
+
+FINEMAP counts of SNPs in probability bins:
+
+```{r eval=FALSE}
+ggplot(finemap_probs %>% mutate(finemap_prob2 = if_else(finemap_prob < 0.0001, 0.0001, finemap_prob)),
+       aes(x=finemap_prob2)) +
+  geom_histogram() + scale_x_log10() + scale_y_log10()
+```
+
+FINEMAP number of SNPs with prob > 0.5.
+
+```{r}
+nrow(finemap_probs %>% filter(finemap_prob > 0.5))
+```
+
+FINEMAP has nearly twice as many SNPs with prob > 0.5 as we got with GCTA.
+
+## Compare Methods
+
+Next we exclude a handful of loci where at least one SNP has p < 1e-300, since some of these seemed problematic with FINEMAP (and possibly also GCTA). We define "loci" by merging together any SNPs which have a lead SNP within 500 kb of another lead SNP.
+
+After merging, we have the below number of signals and loci.
+
+We next look at the number of "signals" defined by GCTA at these loci (first with normal Y axis, then logged).
+
+```{r}
+# Merging together the FINEMAP and GCTA datasets to define "loci" is tricky.
+# For GCTA we have "independent lead variants", while for FINEMAP we have simply
+# run it in a window of +/- 500 kb around each GCTA variant, and then taken the
+# max SNP probability for each SNP from these runs.
+
+# I first tried using the distance between GCTA lead SNPs to define loci - but
+# then you can't assign many FINEMAP SNPs to loci. I tried ordering all SNPs by
+# chr:pos, and using either lead SNP distance or distance between successive SNPs
+# to define loci - but you get a number of cases where a new "locus" is defined
+# simply because FINEMAP has SNPs > 500 kb away from other SNPs... I'm not sure
+# exactly why, but it causes spurious locus definitions.
+
+# What I'll do is to first use a generous locus definition that includes any
+# SNP within 1 Mb as being at the same locus. This should stringently identify
+# loci with a single causal variant, which we can then use to look at single-variant
+# loci. Then I'll use a strict locus definition that defines a new 
+
+get_finemap_signal_pos = function(locus) {
+  as.integer(sapply(str_split(locus, ":"), FUN = function(l) l[2]))
+}
+
+merged_df = gcta_credset %>%
+  full_join(finemap_probs,
+            by = c("study_id", "variant_id" = "finemap_variant_id")) %>%
+  mutate(chr = if_else(is.na(gcta_chr), finemap_chr, gcta_chr),
+         pos = if_else(is.na(gcta_pos), finemap_pos, gcta_pos),
+         gcta_prob = if_else(is.na(gcta_prob), 0.0001, gcta_prob),
+         finemap_prob = if_else(is.na(finemap_prob), 0.00001, finemap_prob)) %>%
+  arrange(study_id, chr, pos) %>%
+  mutate(finemap_signal_pos = get_finemap_signal_pos(finemap_locus))
+
+# Exclue a region on chr15 that has rather crazy results for FINEMAP
+merged_df = merged_df %>%
+  filter(!(study_id == "NEALE2_1747_1" & chr == 15 & pos > 26000000 & pos < 29000000),
+         !(study_id == "NEALE2_1747_1" & chr == 12 & pos > 83000000 & pos < 93000000),
+         !(study_id == "NEALE2_1747_1" & chr == 6 & pos > 1 & pos < 10000000),
+         !(study_id == "NEALE2_30130_raw" & chr == 13 & pos > 23000000 & pos < 33000000),
+         !(study_id == "NEALE2_30130_raw" & chr == 9 & pos > 106000000 & pos < 116000000),
+         !(study_id == "NEALE2_1747_1" & chr == 14 & pos > 90000000 & pos < 94000000))
+
+# View(merged_df %>% filter(finemap_prob > 0.5))
+# merged_df = merged_df %>%
+#   mutate(finemap_gt_0.5 = if_else(is.na(finemap_prob), "NA", as.character(finemap_prob > 0.5)),
+#          gcta_gt_0.5 = if_else(is.na(gcta_prob), "NA", as.character(gcta_prob > 0.5)))
+# 
+# check_df = merged_df %>%
+#   group_by(study_id, lead_variant_id) %>%
+#   summarise(total = n(),
+#             finemap_na = sum(is.na(finemap_prob)))
+# xtabs(~ finemap_gt_0.5 + gcta_gt_0.5, merged_df)
+
+#quantile(merged_df %>% filter(is.na(gcta_pos)) %>% .$finemap_prob, probs = seq(0,1,0.01))
+#View(merged_df %>% filter(is.na(gcta_pos)) %>% arrange(desc(finemap_prob)))
+
+# Try doing the clumping with finemap lead pos rather than GCTA, since FINEMAP results cover
+# many more SNPs
+loci_df = merged_df %>%
+  group_by(study_id) %>%
+  arrange(study_id, chr, pos) %>%
+  mutate(pos_diff = abs(pos - lag(pos)) + 1e6 * (as.integer(chr) - lag(as.integer(chr))),
+         pos_diff = if_else(is.na(pos_diff), 1e6, pos_diff),
+         signal_pos = pmax(lead_pos, finemap_signal_pos, na.rm=T),
+         lead_pos_diff = abs(signal_pos - lag(signal_pos)) + 1e6 * abs(as.integer(chr) - lag(as.integer(chr))),
+#         locus_index = cumsum(pos_diff > 5e5)) %>%
+         locus_index = cumsum((!is.na(lead_pos_diff) & lead_pos_diff > 5e5) & pos_diff > 2e5) + 1) %>%
+  filter(gcta_prob > 0.001 | finemap_prob > 0.001) %>%
+  select(locus_index, lead_pos, finemap_signal_pos, lead_pos_diff, everything()) 
+
+study_num_signals = loci_df %>%
+  group_by(study_id) %>%
+  summarise(num_signals = max(locus_index),
+            .groups = 'drop')
+
+locus_num_signals = loci_df %>%
+  group_by(study_id, locus_index) %>%
+  summarise(num_signals = length(unique(finemap_locus)),
+            signals = paste(unique(finemap_locus), collapse = ";"),
+            .groups = 'drop')
+
+loci_df = loci_df %>%
+  left_join(locus_num_signals, by = c("study_id", "locus_index"))
+
+failed_loci = locus_num_signals %>%
+  filter(signals == "NA")
+
+loci_df = loci_df %>%
+  anti_join(failed_loci, by=c("study_id", "locus_index"))
+
+locus_summary = loci_df %>%
+  group_by(study_id, locus_index) %>%
+  summarise(gcta_credset_prob = sum(gcta_prob * is95_credset, na.rm=T),
+            finemap_overlap_with_gcta = sum(finemap_prob * is95_credset, na.rm=T),
+            finemap_credset_prob = sum(finemap_prob * (finemap_prob > 0.01), na.rm=T),
+            gcta_overlap_with_finemap = sum(gcta_prob * (finemap_prob > 0.01), na.rm=T),
+            .groups = 'drop') %>%
+  mutate(finemap_overlap_with_gcta_normalised = finemap_overlap_with_gcta / gcta_credset_prob,
+         gcta_overlap_with_finemap_normalised = gcta_overlap_with_finemap / finemap_credset_prob)
+
+# Remove a handful of loci with nonsensical GCTA credset probability
+locus_summary = locus_summary %>%
+  filter(gcta_credset_prob > 0.8)
+
+loci_df = loci_df %>%
+  inner_join(locus_summary %>% select(study_id, locus_index))
+
+#print(sprintf("Number of signals: %d", nrow(unique(loci_df %>% select(study_id, lead_pos)))))
+#print(sprintf("Number of signals: %d", nrow(unique(loci_df %>% select(study_id, finemap_signal_pos)))))
+print(sprintf("Number of signals: %d", nrow(unique(loci_df %>% select(study_id, lead_variant_id)))))
+print(sprintf("Number of loci: %d", nrow(unique(loci_df %>% select(study_id, locus_index)))))
+```
+
+
+We next look at the number of "signals" defined by GCTA at these loci (first with normal Y axis, then logged).
+
+```{r}
+p = ggplot(locus_num_signals, aes(x=num_signals)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~study_id, scales = "free_y")
+print(p)
+print(p + scale_y_log10())
+
+#View(loci_df %>% filter(study_id == "NEALE2_6138_1", chr == 8))
+```
+
+Next we consider GCTA 95% credible set SNPs, and ask what is the sum of the SNP probabilities from FINEMAP for these SNPs at each locus.
+
+```{r}
+ggplot(locus_summary, aes(x=gcta_credset_prob, y=finemap_overlap_with_gcta)) +
+  geom_point(alpha=0.3) +
+  geom_abline(slope=1, intercept=0) +
+  xlab("Locus GCTA 95% credset probability sum") +
+  ylab("Locus FINEMAP probability sum") +
+  ggtitle("SNP probability sum for GCTA 95% credset SNPs")
+```
+
+You have values greater than once since some loci have more than one independent signal.
+In general, FINEMAP gives similar / high probability to SNPs within the GCTA 95% credible set at each locus.
+
+Looking at the locus level masks the fact that individual SNP probabilities often differ between FINEMAP and GCTA.
+
+```{r}
+ggplot(loci_df, aes(x=gcta_prob, y=finemap_prob)) +
+  geom_point(alpha=0.2) +
+  geom_abline(slope=1, intercept=0) +
+  xlab("GCTA SNP probability") + ylab("FINEMAP SNP probability")
+```
+
+We can take the ratio (FINEMAP probability sum / GCTA probability sum) per locus as another way to quantify whether FINEMAP has good overlap with GCTA.
+
+
+```{r}
+ggplot(locus_summary %>% filter(gcta_credset_prob > 0), aes(x=finemap_overlap_with_gcta / gcta_credset_prob)) +
+  geom_histogram(bins = 50)
+```
+
+The median of this distribution is:
+
+```{r}
+median(locus_summary$finemap_overlap_with_gcta_normalised, na.rm=T)
+```
+
+We can do the same, but looking at the sum of GCTA SNP probability across FINEMAP SNPs that have probability > 0.01. (We don't have 95% credible sets for FINEMAP.)
+
+```{r}
+ggplot(locus_summary, aes(x=finemap_credset_prob, y=gcta_overlap_with_finemap)) +
+  geom_point(alpha=0.3) +
+  geom_abline(slope=1, intercept=0)
+
+ggplot(locus_summary %>% filter(finemap_credset_prob > 0), aes(x=gcta_overlap_with_finemap / finemap_credset_prob)) +
+  geom_histogram(bins = 50)
+
+# ggplot(locus_summary %>% filter(finemap_credset_prob < 2), aes(x=finemap_credset_prob, y=gcta_overlap_with_finemap)) +
+#   geom_point(alpha=0.3) +
+#   geom_abline(slope=1, intercept=0)
+```
+
+Above you also have the ratio (GCTA credset SNP probability sum / FINEMAP sum for SNPs with prob > 0.01)
+We see that GCTA has lower SNP probability for FINEMAP credible SNPs. I think we can attribute this to:
+
+- FINEMAP finds secondary associations that we miss with GCTA due to using a strict 5e-8 cutoff
+- FINEMAP could be overfitting in some cases and finding non-causal SNPs
+
+The median GCTA normalised overlap with FINEMAP SNPs (prob > 0.01) is:
+
+```{r}
+median(locus_summary$gcta_overlap_with_finemap_normalised)
+```
+
+
+
+
+
+```{r echo=FALSE, eval=FALSE}
+
+merged_df2 = merged_df %>%
+  group_by(study_id) %>%
+  arrange(study_id, chr, pos) %>%
+  mutate(pos_diff = abs(pos - lag(pos)) + 1e6 * (as.integer(chr) - lag(as.integer(chr))),
+         pos_diff = if_else(is.na(pos_diff), 1e6, pos_diff),
+         lead_pos_diff = abs(lead_pos - lag(lead_pos)) + 1e6 * (as.integer(lead_chr) - lag(as.integer(lead_chr))),
+         locus_index = cumsum(pos_diff > 5e5)) %>%
+#         locus_index = cumsum((!is.na(lead_pos_diff) & lead_pos_diff > 5e5) | pos_diff > 2e5)) %>%
+  filter(gcta_prob > 0.001 | finemap_prob > 0.001) %>%
+  select(locus_index, lead_pos, lead_pos_diff, everything()) 
+
+gcta_df2 = gcta_credset %>%
+  group_by(study_id) %>%
+  arrange(study_id, lead_pos, gcta_chr, gcta_pos) %>%
+  mutate(pos_diff = abs(gcta_pos - lag(gcta_pos)) + 1e6 * (as.integer(gcta_chr) - lag(as.integer(gcta_chr))),
+         pos_diff = if_else(is.na(pos_diff), 1e6, pos_diff),
+         lead_pos_diff = abs(lead_pos - lag(lead_pos)) + 1e6 * (as.integer(lead_chr) - lag(as.integer(lead_chr))),
+         locus_index = cumsum(pos_diff > 5e5)) %>%
+#         locus_index = cumsum((!is.na(lead_pos_diff) & lead_pos_diff > 5e5) | pos_diff > 5e5)) %>%
+  select(locus_index, lead_pos, lead_pos_diff, everything()) 
+
+merged_df2 %>% group_by(study_id) %>% summarise(loci = length(unique(locus_index)))
+gcta_df2 %>% group_by(study_id) %>% summarise(loci = length(unique(locus_index)))
+
+
+merged_nas = loci_df %>%
+  group_by(study_id, locus_index) %>%
+  summarise(numvars = n(),
+            gcta_nas = sum(is.na(gcta_prob)),
+            finemap_nas = sum(is.na(finemap_prob)))
+
+
+```
+

@@ -1,0 +1,58 @@
+---
+title: "Fine mapping comparison"
+author: "Jeremy Schwartzentruber"
+date: "12/11/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggplot2)
+
+otg = "/Users/jeremys/work/otgenetics"
+```
+
+## Selecting studies for fine-mapping comparison
+
+We need to compare our results, done using GCTA-cojo to get independent signals + Approximate Bayes Factor (ABF) fine-mapping of the conditionally independent signals, with more modern approaches like FINEMAP. To do this we'll select a handful of GWAS to use when comparing the two methods.
+
+First, we downloaded all studies and ordered by number of associations.
+
+```{r}
+toploci = read_tsv(file.path(otg, "gs/genetics-portal-staging/v2d/190705/toploci.tsv"))
+
+study_locus_counts = toploci %>%
+  group_by(study_id) %>%
+  summarise(num_loci = n())
+
+studies = read_tsv(file.path(otg, "gs/genetics-portal-staging/v2d/190705/studies.tsv")) %>%
+  arrange(desc(num_assoc_loci)) %>%
+  filter(study_id %in% study_locus_counts$study_id)
+
+ukb_studies = studies %>%
+  filter(grepl("NEALE|SAIGE", study_id))
+```
+
+Next, we selected five studies -- three quantitative traits (from Neale et al) and two binary traits (from SAIGE) for further investigation.
+
+Here, we look at the distribution of credible set sizes (from GCTA + ABF) across loci for each of the studies.
+
+```{r}
+
+selected_studies = read_tsv(file.path(otg, "natgen_paper/fine_mapping/selected_ukb_studies.txt"))
+
+finemapping = read_tsv(file.path(otg, "gs/genetics-portal-staging/v2d/190705/finemapping.tsv.gz"))
+finemapping_selected = selected_studies %>%
+  select(study_id, trait_reported,) %>%
+  left_join(finemapping, by="study_id")
+finemapping_selected_credset_sizes = finemapping_selected %>%
+  group_by(study_id, trait_reported, lead_chrom, lead_pos) %>%
+  summarise(credset_size = n())
+
+ggplot(finemapping_selected_credset_sizes, aes(x=credset_size)) +
+  geom_histogram() +
+  facet_wrap(~trait_reported) +
+  scale_x_log10()
+```
+

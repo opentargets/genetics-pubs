@@ -1,0 +1,220 @@
+---
+title: "L2G enrichment for Mendelian Disease"
+author: "Jeremy Schwartzentruber"
+date: "09/12/2020"
+output: html_document
+---
+
+We ran MendelVar (https://mendelvar.mrcieu.ac.uk/) using lead SNPs (top loci from Open Targets Genetics) for 9 traits. We loaded the disease_overlap.txt file for each result, which has the Mendelian disease genes that overlap within a window around each SNP. I used a window of 100 kb. Each locus may therefore have more than one gene overlap, and some of these may have a matching phenotype, based on HPO, while others may not.
+
+I manually selected a number of HPO terms specific to each GWAS trait by searching EBI's ontology lookup (https://www.ebi.ac.uk/ols/search), and recorded these in a file studies_hpo.tsv. (Also online: https://docs.google.com/spreadsheets/d/1ibTIMnGqeMF4zoPjTEEamUZ4V533ChhmAP6GYdYkG_M/edit#gid=0). Using this, I determine whether each overlapping Mendelian disease gene has a phenotype matching the GWAS trait. I then annotate the locus2gene score for each GWAS study/gene combination.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F)
+library(tidyverse)
+theme_set(theme_bw())
+
+dir = "/Users/jeremys/work/otgenetics/natgen_paper/paper_revisions1/mendelvar"
+```
+
+## L2G distribution
+
+Here, I plot the distribution of L2G scores for genes with a matching Mendelian disease, genes with a non-matching Mendelian disease, and all other L2G genes.
+
+One confounding factor is that L2G scores include all genes within 500 kb, whereas for MendelVar I used a window of 100 kb, expecting that this would give a better enrichment.
+
+```{r}
+# First need to run steps in file get_selected_studies_top_loci.sh
+
+studies = read_tsv(file.path(dir, "studies_hpo.tsv"), col_types = cols())
+
+# Determines if any of the terms in the list 'terms1' match a term in the
+# string 'terms2'
+HPO_match = function(terms1, terms2) {
+  terms1_hpo = str_split(terms1, ";")[[1]]
+  matches = terms1_hpo[sapply(terms1_hpo, function(s) grepl(s, terms2))]
+  if (length(matches) == 0) {
+    return(NA)
+  }
+  paste(matches, collapse=";")
+}
+# terms1 = "0001663;0005110;0004757;0004754;0033122;0005115;0001692;0025478; 0004749; 0001631"
+# trait_hpo = str_split(terms1, ";")[[1]]
+# terms2 = "0004757;0006699;0200127;0025478;0001706"
+# HPO_match(terms1, terms2)
+
+# For each of the studies we ran with MenelVar, determine whether the overlapping
+# Mendelian genes have a matching HPO term
+disease_overlap_list = list()
+for (i in 1:nrow(studies)) {
+  study_trait = paste("mendelvar_results", studies$Study_ID[i], studies$Trait[i], sep="_")
+  trait_hpo = str_split(studies$HPO[i], ";")[[1]]
+  disease_overlap = read_tsv(file.path(dir, study_trait, "disease_overlap.txt"), col_types = cols())
+  # disease_overlap = disease_overlap %>%
+  #   rowwise() %>%
+  #   mutate(matching_hpos = HPO_match(trait_hpo, hpo))
+  disease_overlap$trait_hpo = studies$HPO[i]
+  disease_overlap$study_id = studies$Study_ID[i]
+  disease_overlap$trait = studies$Trait[i]
+  disease_overlap_list[[i]] = disease_overlap
+}
+
+disease_overlap_all = bind_rows(disease_overlap_list) %>%
+  select(study_id, trait, everything())
+
+disease_overlap_all = disease_overlap_all %>%
+  rowwise() %>%
+  mutate(matching_hpos = HPO_match(trait_hpo, hpo))
+
+# Merge this table with the L2G scores
+l2g_selected = read_tsv(file.path(dir, "selected_studies.l2g.tsv"), col_types = cols()) %>%
+  filter(training_ft == "full_model") %>%
+  mutate(ID = paste(chrom, pos, ref, alt, sep=":"))
+
+disease_overlap_l2g = disease_overlap_all %>%
+  rename(gene_id=Ensembl_gene_id) %>%
+  left_join(l2g_selected %>% select(study_id, gene_id, ID, l2g = y_proba),
+            by=c("study_id", "ID", "gene_id")) %>%
+  rowwise() %>%
+  mutate(hpo_match = !is.na(matching_hpos))
+
+# Now we want to add in all the L2G genes that were NOT a Mendelian
+# disease overlap. First we do a join to get the overlaps, and remove
+# these.
+l2g_only = l2g_selected %>%
+  select(study_id, gene_id, ID, l2g = y_proba) %>%
+  left_join(disease_overlap_l2g %>% select(study_id, ID, gene_id, disease_name),
+            by=c("study_id", "ID", "gene_id")) %>%
+  arrange(desc(disease_name)) %>%
+  group_by(study_id, gene_id, ID) %>%
+  summarise(l2g = first(l2g),
+            disease_name = first(disease_name),
+            .groups = 'drop') %>%
+  filter(is.na(disease_name)) %>%
+  select(-disease_name)
+
+# There are often multiple Mendelian diseases annotated for a given
+# gene... but we only care whether any of them have a phenotype match.
+# The L2G score will be the same for a given gene, i.e. duplicated
+# across Mendelian disease matches.
+disease_overlap_l2g = disease_overlap_l2g %>%
+  group_by(study_id, gene_id) %>%
+  summarise(ID = first(ID),
+            hpo_match = any(hpo_match),
+            l2g = mean(l2g),
+            .groups = 'drop') %>%
+  mutate(category = if_else(hpo_match, "Matching trait", "Non-matching trait"))
+
+l2g_only = l2g_only %>%
+  mutate(category = "No Mendelian gene")
+
+disease_overlap_l2g_full = bind_rows(disease_overlap_l2g, l2g_only) %>%
+  left_join(studies %>% select(study_id = Study_ID, trait = Trait), by="study_id") %>%
+  filter(!is.na(trait)) %>%
+  filter(!is.na(l2g))
+
+```
+
+
+```{r}
+disease_overlap_l2g_full$category = factor(disease_overlap_l2g_full$category, levels=c("No Mendelian gene", "Non-matching trait", "Matching trait"))
+
+disease_overlap_l2g_full_nomatch = disease_overlap_l2g_full %>%
+  filter(category == "No Mendelian gene")
+disease_overlap_l2g_full_match = disease_overlap_l2g_full %>%
+  filter(category != "No Mendelian gene")
+
+p = ggplot(disease_overlap_l2g_full, aes(x=category, y=l2g)) +
+  geom_violin(scale="width", alpha=0.8) +
+  geom_jitter(data = disease_overlap_l2g_full_nomatch, alpha = 0.05, width = 0.2) +
+  geom_jitter(data = disease_overlap_l2g_full_match, alpha = 0.15, width = 0.2) +
+  geom_violin(data = disease_overlap_l2g_full_match, scale="width", alpha=0.5) +
+  facet_wrap(~trait) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1)) +
+  xlab("Mendelian gene category") + ylab("L2G score")
+print(p)
+pdf("mendelvar_violin_plot.all_l2g.pdf", width=6, height=4.5)
+print(p)
+invisible(dev.off())
+```
+
+Let's also plot it without the "No Mendelian gene" case.
+
+```{r}
+p = ggplot(disease_overlap_l2g_full_match, aes(x=category, y=l2g)) +
+  geom_jitter(alpha = 0.2, width = 0.2) +
+  geom_violin(scale="width", alpha=0.5) +
+  facet_wrap(~trait) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1)) +
+  xlab("Mendelian gene category") + ylab("L2G score")
+print(p)
+pdf("mendelvar_violin_plot.pdf", width=6, height=4.5)
+print(p)
+invisible(dev.off())
+```
+
+## Enrichments
+
+Here we look at the enrichment of genes with L2G score > 0.5 for matching traits vs. non-matching (Fisher's exact test).
+
+```{r}
+# overlap_counts = disease_overlap_l2g %>%
+#   filter(!is.na(l2g)) %>%
+#   mutate(category = factor(category, levels = c("Non-matching trait", "Matching trait")),
+#          l2g_gt_0.5 = factor(if_else(l2g >= 0.5, "L2G >= 0.5", "L2G < 0.5"))) %>%
+#   group_by(study_id, category, l2g_gt_0.5) %>%
+#   summarise(count = n())
+
+disease_overlap_l2g_or = disease_overlap_l2g %>%
+  mutate(category = factor(category, levels = c("Non-matching trait", "Matching trait")),
+         l2g_gt_0.5 = factor(if_else(l2g >= 0.5, "L2G >= 0.5", "L2G < 0.5")),
+         l2g_gt_0.1 = factor(if_else(l2g >= 0.1, "L2G >= 0.1", "L2G < 0.1")))
+
+calcOddsRatios = function(df, cat1, cat2) {
+  df = df[, c(cat1, cat2)]
+  if (any(is.na(df))) {
+    warning("stratifiedOddsRatios: Note - input table has NA values. These will be omitted.")
+    df = na.omit(df)
+  }
+  cat1levels = levels(pull(df,cat1))
+  cat2levels = levels(pull(df,cat2))
+  cat1base = levels(pull(df,cat1))[1]
+  cat2base = levels(pull(df,cat2))[1]
+  oddsRatio.df = data.frame(comparisonStr = character(), cat1 = character(), cat2 = character(),
+                            estimate = numeric(), confint_lo = numeric(), confint_hi = numeric())
+  cat1higherLevels = cat1levels[cat1levels != cat1base]
+  cat2higherLevels = cat2levels[cat2levels != cat2base]
+  
+  for (cat1level in cat1higherLevels) {
+    for (cat2level in cat2higherLevels) {
+      mat = matrix(c(sum(df[,cat1] == cat1level & df[,cat2] == cat2level),
+                     sum(df[,cat1] != cat1level & df[,cat2] == cat2level),
+                     sum(df[,cat1] == cat1level & df[,cat2] != cat2level),
+                     sum(df[,cat1] != cat1level & df[,cat2] != cat2level)), nrow=2)
+      comparisonStr = sprintf("%s to %s", cat1level, cat2level)
+      res = fisher.test(mat)
+      oddsRatio.df = bind_rows(oddsRatio.df,
+                               data.frame(comparisonStr, cat1 = cat1level, cat2 = cat2level,
+                                          estimate = res$estimate, confint_lo = res$conf.int[1], confint_hi = res$conf.int[2], p_value = res$p.value))
+    }
+  }
+  oddsRatio.df
+}
+
+ors.df = disease_overlap_l2g_or %>%
+    dplyr::filter(!is.na(l2g_gt_0.5)) %>%
+    group_by(study_id) %>%
+    do( calcOddsRatios(., "category", "l2g_gt_0.5") )
+
+ors.df = ors.df %>%
+  select(-comparisonStr, -cat1, -cat2) %>%
+  left_join(studies %>% select(study_id = Study_ID, trait = Trait), by="study_id") %>%
+  select(study_id, trait, OR = estimate, OR_conf_lo = confint_lo, OR_conf_hi = confint_hi, everything())
+
+write_tsv(ors.df, file.path(dir, "mendelvar_overlap_odds_ratios.tsv"))
+
+knitr::kable(ors.df)
+
+```
+
